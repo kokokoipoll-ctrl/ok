@@ -1,0 +1,915 @@
+import json
+import math
+import os
+import random
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+WIDTH, HEIGHT = 960, 540
+GROUND_Y = HEIGHT - 85
+FPS_MS = 1000 // 120
+
+# --- Physics ---------------------------------------------------------------
+GRAVITY = 0.62
+JUMP_VELOCITY = -10.5           # reduced jump power (was -13.0)
+TERMINAL_VELOCITY = 15          # cap fall speed so it never feels out of control
+APEX_THRESHOLD = 2.2            # |vel_y| below this = "near the top of the jump"
+APEX_GRAVITY_SCALE = 0.5        # floatier gravity near the apex, for a nicer feel
+PLAYER_SIZE = 32
+PLAYER_START_X = 120
+BASE_SPEED = 6.5
+
+JUMP_APEX_HEIGHT = (JUMP_VELOCITY ** 2) / (2 * GRAVITY)
+
+CUBE = 30  # grid cell size (level-space units) used by the editor
+
+FINISH_WIDTH = 26
+FINISH_MARGIN = 250  # gap between the last placed object and the finish wall
+
+BG_TOP = "#0b1021"
+BG_BOTTOM = "#182042"
+GROUND_COLOR = "#23263d"
+GRID_COLOR = "#202742"
+ACCENT_COLOR = "#34d7ff"
+PLAYER_COLOR = "#39e6ff"
+SPIKE_COLOR = "#ff4d6d"
+BLOCK_COLOR = "#8a4dff"
+DECOR_COLOR = "#ffd166"
+TEXT_COLOR = "#f7fbff"
+PANEL_COLOR = "#10162b"
+BUTTON_COLOR = "#1a2342"
+BUTTON_HOVER = "#26345f"
+EDITOR_COLOR = "#16203b"
+
+DEFAULT_FILL = {"spike": SPIKE_COLOR, "block": BLOCK_COLOR, "decor": DECOR_COLOR}
+
+FILL_PALETTE = ["#8a4dff", "#ff4d6d", "#34d7ff", "#ffd166", "#06d6a0", "#f72585", "#ffffff", "#495371"]
+OUTLINE_PALETTE = ["#f7fbff", "#000000", "#34d7ff", "#ff4d6d", "#06d6a0"]
+BG_PRESETS = [
+    ("#0b1021", "#182042"),
+    ("#1a0b21", "#3a1550"),
+    ("#0b211a", "#144d34"),
+    ("#211a0b", "#4d3414"),
+    ("#0b1621", "#0f3a63"),
+    ("#210b1a", "#4d1440"),
+]
+
+LEVELS_DIR = "levels"
+CUSTOM_LEVELS_FILE = os.path.join(LEVELS_DIR, "custom_levels.json")
+
+# Editor viewport (the region of canvas that represents the level)
+EDITOR_VIEW_X0 = 240
+EDITOR_VIEW_X1 = WIDTH - 20
+EDITOR_LEVEL_WIDTH = 4000
+EDITOR_PAN_STEP = 150
+EDITOR_ZOOM = 1.6  # bigger on-screen cells -> easier, more precise placement
+
+
+class GeometryDash:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Geometry Dash - Tkinter Edition")
+        self.root.resizable(False, False)
+
+        os.makedirs(LEVELS_DIR, exist_ok=True)
+
+        self.canvas = tk.Canvas(root, width=WIDTH, height=HEIGHT, bg=BG_TOP, highlightthickness=0)
+        self.canvas.pack()
+
+        self.root.bind("<space>", self.on_jump)
+        self.root.bind("<Up>", self.on_jump)
+        self.root.bind("<Button-1>", self.on_left_click)
+        self.root.bind("<r>", self.on_restart)
+        self.root.bind("<R>", self.on_restart)
+        self.root.bind("<Escape>", self.show_menu)
+        self.root.bind("<Delete>", self.editor_delete_selected)
+
+        self.canvas.bind("<ButtonPress-3>", self.editor_pan_start)
+        self.canvas.bind("<B3-Motion>", self.editor_pan_drag)
+        self.root.bind("<Left>", self.editor_pan_key)
+        self.root.bind("<Right>", self.editor_pan_key)
+        self.canvas.bind("<MouseWheel>", self.editor_pan_wheel)
+        self.canvas.bind("<Button-4>", self.editor_pan_wheel)
+        self.canvas.bind("<Button-5>", self.editor_pan_wheel)
+
+        self.levels = self.load_builtin_levels()
+        self.custom_levels = self.load_custom_levels()
+        self.levels.extend(self.custom_levels)
+
+        self.selected_level_index = 0
+        self.mode = "menu"
+        self.after_id = None
+        self.menu_buttons = []
+        self.preview_running = False
+
+        self.editor_tool = "spike"
+        self.editor_fill_color = None
+        self.editor_outline_color = None
+        self.editor_bg_index = 0
+        self.editor_level = {"name": "New Level", "speed": 1.0, "objects": [],
+                              "bg_top": BG_PRESETS[0][0], "bg_bottom": BG_PRESETS[0][1]}
+        self.editor_selected_item = None
+        self.editor_camera_x = 0
+        self._pan_last_x = None
+
+        self.bg_top = BG_TOP
+        self.bg_bottom = BG_BOTTOM
+
+        self.reset_game_state()
+        self.show_menu()
+        self.schedule_loop()
+
+    def schedule_loop(self):
+        if self.after_id is not None:
+            try:
+                self.root.after_cancel(self.after_id)
+            except tk.TclError:
+                pass
+        self.after_id = self.root.after(FPS_MS, self.loop)
+
+    # ------------------------------------------------------------------
+    # Level data
+    # ------------------------------------------------------------------
+    def load_builtin_levels(self):
+        return [
+            {"name": "Starter", "speed": 1.0, "objects": [
+                {"type": "spike", "x": 520, "y": GROUND_Y - 30, "w": 30, "h": 30},
+                {"type": "spike", "x": 650, "y": GROUND_Y - 30, "w": 30, "h": 30},
+                {"type": "block", "x": 800, "y": GROUND_Y - 60, "w": 30, "h": 60},
+            ]},
+            {"name": "Rhythm", "speed": 1.05, "objects": [
+                {"type": "spike", "x": 480, "y": GROUND_Y - 30, "w": 30, "h": 30},
+                {"type": "spike", "x": 640, "y": GROUND_Y - 30, "w": 30, "h": 30},
+                {"type": "spike", "x": 675, "y": GROUND_Y - 30, "w": 30, "h": 30},
+                {"type": "block", "x": 820, "y": GROUND_Y - 60, "w": 30, "h": 60},
+                {"type": "spike", "x": 950, "y": GROUND_Y - 30, "w": 30, "h": 30},
+            ]},
+        ]
+
+    def load_custom_levels(self):
+        if not os.path.exists(CUSTOM_LEVELS_FILE):
+            return []
+        try:
+            with open(CUSTOM_LEVELS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def save_custom_levels(self):
+        custom = [lvl for lvl in self.levels if lvl.get("custom")]
+        with open(CUSTOM_LEVELS_FILE, "w", encoding="utf-8") as f:
+            json.dump(custom, f, indent=2)
+
+    # ------------------------------------------------------------------
+    # Shared canvas helpers
+    # ------------------------------------------------------------------
+    def clear_canvas_state(self):
+        self.canvas.delete("all")
+        self.menu_buttons = []
+        self.editor_selected_item = None
+
+    def reset_game_state(self):
+        self.player_x = PLAYER_START_X
+        self.player_y = GROUND_Y - PLAYER_SIZE
+        self.vel_y = 0
+        self.on_ground = True
+        self.rotation = 0
+
+        self.obstacles = []
+        self.particles = []
+        self.level = self.levels[self.selected_level_index]
+        self.speed = BASE_SPEED * self.level.get("speed", 1.0)
+        self.bg_top = self.level.get("bg_top", BG_TOP)
+        self.bg_bottom = self.level.get("bg_bottom", BG_BOTTOM)
+        self.score = 0
+        self.distance = 0
+        self.game_over = False
+        self.won = False
+        self.started = False
+        self.bg_offset = 0
+        self.clouds = self.make_clouds()
+        self.stars = self.make_stars()
+
+    def make_stars(self):
+        return [{"x": random.randint(0, WIDTH), "y": random.randint(20, GROUND_Y - 160),
+                 "r": random.randint(1, 2), "s": random.uniform(0.2, 0.8)} for _ in range(60)]
+
+    def make_clouds(self):
+        return [{"x": random.randint(0, WIDTH), "y": random.randint(30, 180),
+                 "w": random.randint(60, 130), "h": random.randint(18, 38),
+                 "s": random.uniform(0.2, 0.5)} for _ in range(7)]
+
+    def draw_background(self):
+        self.canvas.delete("bg")
+        top = self.bg_top
+        bottom = self.bg_bottom
+        for y in range(0, HEIGHT, 4):
+            t = y / HEIGHT
+            c = self.blend(top, bottom, t)
+            self.canvas.create_rectangle(0, y, WIDTH, y + 4, outline="", fill=c, tags="bg")
+
+        for star in self.stars:
+            star["x"] -= star["s"]
+            if star["x"] < 0:
+                star["x"] = WIDTH
+                star["y"] = random.randint(20, GROUND_Y - 160)
+            self.canvas.create_oval(star["x"], star["y"], star["x"] + star["r"], star["y"] + star["r"],
+                                     fill="#ffffff", outline="", tags="bg")
+
+        for cloud in self.clouds:
+            cloud["x"] -= cloud["s"]
+            if cloud["x"] + cloud["w"] < 0:
+                cloud["x"] = WIDTH + random.randint(20, 120)
+                cloud["y"] = random.randint(30, 180)
+            x, y, w, h = cloud["x"], cloud["y"], cloud["w"], cloud["h"]
+            self.canvas.create_oval(x, y, x + w * 0.55, y + h, fill="#2a355f", outline="", tags="bg")
+            self.canvas.create_oval(x + w * 0.22, y - h * 0.3, x + w * 0.72, y + h * 1.05, fill="#2f3a67", outline="", tags="bg")
+            self.canvas.create_oval(x + w * 0.46, y, x + w, y + h, fill="#2a355f", outline="", tags="bg")
+
+        self.canvas.create_rectangle(0, GROUND_Y, WIDTH, HEIGHT, fill=GROUND_COLOR, outline="", tags="bg")
+        self.canvas.create_line(0, GROUND_Y, WIDTH, GROUND_Y, fill=ACCENT_COLOR, width=3, tags="bg")
+        for x in range(-int(self.bg_offset) % 40, WIDTH, 40):
+            self.canvas.create_line(x, 0, x, GROUND_Y, fill=GRID_COLOR, tags="bg")
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, outline="#2c3764", width=2, tags="bg")
+
+    def blend(self, a, b, t):
+        a = a.lstrip("#")
+        b = b.lstrip("#")
+        ar, ag, ab = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
+        br, bg, bb = int(b[0:2], 16), int(b[2:4], 16), int(b[4:6], 16)
+        r = int(ar + (br - ar) * t)
+        g = int(ag + (bg - ag) * t)
+        bl = int(ab + (bb - ab) * t)
+        return f"#{r:02x}{g:02x}{bl:02x}"
+
+    def player_points(self):
+        cx = self.player_x + PLAYER_SIZE / 2
+        cy = self.player_y + PLAYER_SIZE / 2
+        # subtle squash/stretch based on vertical speed -- makes the jump
+        # arc read as snappier without changing the actual hitbox timing
+        stretch = 1.0
+        squish = 1.0
+        if not self.on_ground:
+            t = max(-1.0, min(1.0, self.vel_y / 12.0))
+            stretch = 1.0 + 0.14 * abs(t)
+            squish = 1.0 - 0.10 * abs(t)
+        half_w = (PLAYER_SIZE / 2) * squish
+        half_h = (PLAYER_SIZE / 2) * stretch
+        corners = [(-half_w, -half_h), (half_w, -half_h), (half_w, half_h), (-half_w, half_h)]
+        rad = math.radians(self.rotation)
+        cos_r, sin_r = math.cos(rad), math.sin(rad)
+        pts = []
+        for dx, dy in corners:
+            rx = dx * cos_r - dy * sin_r
+            ry = dx * sin_r + dy * cos_r
+            pts.extend([cx + rx, cy + ry])
+        return pts
+
+    def make_button(self, x, y, w, h, text, command, tags="ui", font=("Consolas", 16, "bold")):
+        rect = self.canvas.create_rectangle(x, y, x + w, y + h, fill=BUTTON_COLOR, outline="#3d4b7a", width=2, tags=(tags, "button"))
+        label = self.canvas.create_text(x + w / 2, y + h / 2, text=text, fill=TEXT_COLOR, font=font, tags=(tags, "button"))
+
+        def on_enter(event, r=rect):
+            self.canvas.itemconfig(r, fill=BUTTON_HOVER, outline=ACCENT_COLOR)
+
+        def on_leave(event, r=rect):
+            self.canvas.itemconfig(r, fill=BUTTON_COLOR, outline="#3d4b7a")
+
+        self.canvas.tag_bind(rect, "<Enter>", on_enter)
+        self.canvas.tag_bind(rect, "<Leave>", on_leave)
+        self.canvas.tag_bind(label, "<Enter>", on_enter)
+        self.canvas.tag_bind(label, "<Leave>", on_leave)
+
+        self.menu_buttons.append((rect, label, command, x, y, x + w, y + h))
+        return rect, label
+
+    # ------------------------------------------------------------------
+    # Menu / level select
+    # ------------------------------------------------------------------
+    def show_menu(self, event=None):
+        self.mode = "menu"
+        self.clear_canvas_state()
+        self.reset_game_state()
+        self.bg_top, self.bg_bottom = BG_TOP, BG_BOTTOM
+        self.draw_background()
+        self.canvas.create_text(WIDTH / 2, 95, text="GEOMETRY DASH", fill=TEXT_COLOR, font=("Consolas", 32, "bold"), tags="ui")
+        self.canvas.create_text(WIDTH / 2, 132, text="Tkinter Edition", fill=ACCENT_COLOR, font=("Consolas", 14, "bold"), tags="ui")
+        self.make_button(WIDTH / 2 - 130, 200, 260, 48, "Start Game", self.start_selected_level)
+        self.make_button(WIDTH / 2 - 130, 260, 260, 48, "Level Select", self.show_level_select)
+        self.make_button(WIDTH / 2 - 130, 320, 260, 48, "Level Editor", self.open_editor)
+        self.make_button(WIDTH / 2 - 130, 380, 260, 48, "Quit", self.root.destroy)
+        self.canvas.create_text(WIDTH / 2, 485, text="SPACE / CLICK = Jump    ESC = Menu", fill="#c7d4ff", font=("Consolas", 11), tags="ui")
+
+    def show_level_select(self, event=None):
+        self.mode = "select"
+        self.clear_canvas_state()
+        self.draw_background()
+        self.canvas.create_text(WIDTH / 2, 55, text="LEVEL SELECT", fill=TEXT_COLOR, font=("Consolas", 28, "bold"), tags="ui")
+        y = 110
+        for i, lvl in enumerate(self.levels):
+            self.make_button(180, y, 600, 42, f"{i+1}. {lvl['name']}", lambda idx=i: self.select_level(idx), tags="ui", font=("Consolas", 14, "bold"))
+            y += 52
+        self.make_button(20, 20, 120, 34, "Back", self.show_menu, tags="ui", font=("Consolas", 12, "bold"))
+
+    def select_level(self, idx):
+        self.selected_level_index = idx
+        self.start_selected_level()
+
+    def start_selected_level(self, event=None):
+        self.reset_game_state()
+        self.mode = "game"
+        self.clear_canvas_state()
+        self.draw_game_static()
+
+    def draw_game_static(self):
+        self.canvas.delete("ui")
+        self.draw_background()
+        self.player = self.canvas.create_polygon(self.player_points(), fill=PLAYER_COLOR, outline=TEXT_COLOR, width=2, tags="game")
+        self.score_text = self.canvas.create_text(18, 16, anchor="nw", fill=TEXT_COLOR, font=("Consolas", 14, "bold"), text="Score: 0", tags="ui")
+        self.level_text = self.canvas.create_text(18, 38, anchor="nw", fill="#c6d7ff", font=("Consolas", 11), text=f"Level: {self.level['name']}", tags="ui")
+        self.msg_text = self.canvas.create_text(WIDTH / 2, HEIGHT / 2 - 25, fill=TEXT_COLOR, font=("Consolas", 20, "bold"), text="Press SPACE / click to start", tags="ui")
+        self.load_level_objects()
+        self.canvas.create_text(WIDTH - 16, 16, anchor="ne", fill="#c6d7ff", font=("Consolas", 11), text="ESC = Menu", tags="ui")
+
+    def load_level_objects(self):
+        self.obstacles = []
+        for obj in self.level.get("objects", []):
+            self.add_obstacle_from_data(obj)
+        self.add_finish_wall()
+
+    def add_finish_wall(self):
+        objs = self.level.get("objects", [])
+        if objs:
+            end_x = max(o["x"] + o["w"] for o in objs) + FINISH_MARGIN
+        else:
+            end_x = 900
+        # finish wall reads like an extension of the floor: same color and
+        # outline as the ground, and it spans almost the full screen height
+        finish = {"type": "finish", "x": end_x, "y": 8, "w": FINISH_WIDTH, "h": GROUND_Y - 8}
+        self.add_obstacle_from_data(finish)
+        self.level_end_x = end_x
+
+    def add_obstacle_from_data(self, obj):
+        t = obj["type"]
+        x, y, w, h = obj["x"], obj["y"], obj["w"], obj["h"]
+        fill = obj.get("fill") or DEFAULT_FILL.get(t, BLOCK_COLOR)
+        outline = obj.get("outline") or TEXT_COLOR
+        if t == "spike":
+            pts = [x, y + h, x + w / 2, y, x + w, y + h]
+            item = self.canvas.create_polygon(pts, fill=fill, outline=outline, width=2, tags="game")
+        elif t == "decor":
+            pts = [x + w / 2, y, x + w, y + h / 2, x + w / 2, y + h, x, y + h / 2]
+            item = self.canvas.create_polygon(pts, fill=fill, outline=outline, width=2, tags="game")
+        elif t == "finish":
+            item = self.canvas.create_rectangle(x, y, x + w, y + h, fill=GROUND_COLOR, outline=ACCENT_COLOR, width=4, tags="game")
+        else:
+            item = self.canvas.create_rectangle(x, y, x + w, y + h, fill=fill, outline=outline, width=2, tags="game")
+        self.obstacles.append({"x": x, "y": y, "w": w, "h": h, "type": t, "id": item})
+
+    # ------------------------------------------------------------------
+    # Input dispatch
+    # ------------------------------------------------------------------
+    def on_left_click(self, event):
+        if self.mode in ("menu", "select"):
+            self.handle_menu_click(event.x, event.y)
+            return
+        if self.mode == "editor":
+            if self.handle_menu_click(event.x, event.y):
+                return
+            self.handle_editor_click(event.x, event.y)
+            return
+        self.on_jump()
+
+    def handle_menu_click(self, x, y):
+        for rect, label, command, x1, y1, x2, y2 in self.menu_buttons:
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                command()
+                return True
+        return False
+
+    def on_jump(self, event=None):
+        if self.mode != "game" or self.game_over:
+            return
+        if not self.started:
+            self.started = True
+            self.canvas.itemconfig(self.msg_text, text="")
+        if self.on_ground:
+            self.vel_y = JUMP_VELOCITY
+            self.on_ground = False
+            self.spawn_jump_particles()
+
+    def spawn_jump_particles(self):
+        for _ in range(6):
+            px = self.player_x + PLAYER_SIZE / 2
+            py = self.player_y + PLAYER_SIZE
+            vx = random.uniform(-3, 3)
+            vy = random.uniform(-4, -1)
+            p = self.canvas.create_oval(px, py, px + 4, py + 4, fill=ACCENT_COLOR, outline="", tags="fx")
+            self.particles.append({"id": p, "x": px, "y": py, "vx": vx, "vy": vy, "life": 30})
+
+    def update_obstacles(self):
+        remove = []
+        for obs in self.obstacles:
+            obs["x"] -= self.speed
+            self.canvas.move(obs["id"], -self.speed, 0)
+            if obs["x"] + obs["w"] < 0:
+                remove.append(obs)
+        for obs in remove:
+            self.canvas.delete(obs["id"])
+            self.obstacles.remove(obs)
+
+    def update_particles(self):
+        keep = []
+        for p in self.particles:
+            p["x"] += p["vx"]
+            p["y"] += p["vy"]
+            p["vy"] += 0.18
+            p["life"] -= 1
+            self.canvas.move(p["id"], p["vx"], p["vy"])
+            if p["life"] > 0:
+                keep.append(p)
+            else:
+                self.canvas.delete(p["id"])
+        self.particles = keep
+
+    def resolve_block_landing(self, prev_bottom, new_bottom):
+        """Let the player stand on top of blocks instead of dying on them.
+        Returns True if the player landed on a block this frame."""
+        landed = False
+        px1 = self.player_x + 5
+        px2 = self.player_x + PLAYER_SIZE - 5
+        for obs in self.obstacles:
+            if obs["type"] != "block":
+                continue
+            ox1, ox2 = obs["x"], obs["x"] + obs["w"]
+            oy1 = obs["y"]
+            if px2 > ox1 and px1 < ox2:
+                if self.vel_y >= 0 and prev_bottom <= oy1 + 1 and new_bottom >= oy1:
+                    self.player_y = oy1 - PLAYER_SIZE
+                    self.vel_y = 0
+                    landed = True
+        return landed
+
+    def check_collision(self):
+        """Returns 'death', 'finish', or None."""
+        pad = 5
+        px1 = self.player_x + pad
+        py1 = self.player_y + pad
+        px2 = self.player_x + PLAYER_SIZE - pad
+        py2 = self.player_y + PLAYER_SIZE - pad
+        for obs in self.obstacles:
+            if obs["type"] == "decor":
+                continue  # purely visual, never interacts with the player
+            ox1, oy1 = obs["x"], obs["y"]
+            ox2, oy2 = obs["x"] + obs["w"], obs["y"] + obs["h"]
+            if px1 < ox2 and px2 > ox1 and py1 < oy2 and py2 > oy1:
+                if obs["type"] == "finish":
+                    return "finish"
+                if obs["type"] == "block":
+                    # standing on top is safe -- only side/underside hits kill
+                    if self.on_ground and abs((self.player_y + PLAYER_SIZE) - oy1) <= 2:
+                        continue
+                    return "death"
+                return "death"
+        return None
+
+    def end_game(self, win=False):
+        self.game_over = True
+        self.won = win
+        if win:
+            self.canvas.itemconfig(self.msg_text, text=f"Level Complete!\nScore: {self.score}\nPress R or ESC")
+        else:
+            self.canvas.itemconfig(self.msg_text, text=f"Game Over!\nScore: {self.score}\nPress R or ESC")
+
+    def on_restart(self, event=None):
+        if self.mode == "game":
+            self.start_selected_level()
+
+    # ------------------------------------------------------------------
+    # Level editor - coordinate helpers (level-space <-> screen-space)
+    # ------------------------------------------------------------------
+    def editor_screen_x(self, level_x):
+        return EDITOR_VIEW_X0 + (level_x - self.editor_camera_x) * EDITOR_ZOOM
+
+    def editor_screen_y(self, level_y):
+        return GROUND_Y - (GROUND_Y - level_y) * EDITOR_ZOOM
+
+    def editor_level_x(self, screen_x):
+        return (screen_x - EDITOR_VIEW_X0) / EDITOR_ZOOM + self.editor_camera_x
+
+    def editor_level_y(self, screen_y):
+        return GROUND_Y - (GROUND_Y - screen_y) / EDITOR_ZOOM
+
+    # ------------------------------------------------------------------
+    # Level editor
+    # ------------------------------------------------------------------
+    def editor_button(self, x, y, w, h, text, command):
+        self.make_button(x, y, w, h, text, command, tags="ui", font=("Consolas", 12, "bold"))
+
+    def open_editor(self, event=None):
+        self.mode = "editor"
+        self.clear_canvas_state()
+        self.editor_level = {"name": "New Level", "speed": 1.0, "objects": [],
+                              "bg_top": BG_PRESETS[0][0], "bg_bottom": BG_PRESETS[0][1]}
+        self.editor_tool = "spike"
+        self.editor_fill_color = None
+        self.editor_outline_color = None
+        self.editor_bg_index = 0
+        self.editor_selected_item = None
+        self.editor_camera_x = 0
+        self.bg_top, self.bg_bottom = BG_PRESETS[0]
+        self.draw_background()
+        self.draw_editor_ui()
+
+    def draw_editor_ui(self):
+        self.canvas.delete("ui")
+        self.canvas.delete("editor_obj")
+        self.canvas.delete("selection")
+        self.canvas.delete("editor_grid")
+        self.canvas.delete("spawn_marker")
+        self.menu_buttons = []
+
+        self.canvas.create_text(20, 12, anchor="nw", text="LEVEL EDITOR", fill=TEXT_COLOR, font=("Consolas", 18, "bold"), tags="ui")
+        self.canvas.create_text(20, 38, anchor="nw", text="Click a cell to place. Erase tool or Del removes.", fill="#c7d4ff", font=("Consolas", 9), tags="ui")
+        self.canvas.create_text(20, 50, anchor="nw", text="Right-drag / arrows / wheel to pan.", fill="#c7d4ff", font=("Consolas", 9), tags="ui")
+
+        self.canvas.create_rectangle(20, 68, 220, 226, fill=PANEL_COLOR, outline="#34406b", width=2, tags="ui")
+        self.canvas.create_text(120, 82, text="TOOLS", fill=ACCENT_COLOR, font=("Consolas", 12, "bold"), tags="ui")
+        self.make_button(40, 100, 160, 26, "Spike", lambda: self.set_tool("spike"), tags="ui", font=("Consolas", 10, "bold"))
+        self.make_button(40, 132, 160, 26, "Block", lambda: self.set_tool("block"), tags="ui", font=("Consolas", 10, "bold"))
+        self.make_button(40, 164, 160, 26, "Decor", lambda: self.set_tool("decor"), tags="ui", font=("Consolas", 10, "bold"))
+        self.make_button(40, 196, 160, 26, "Erase", lambda: self.set_tool("erase"), tags="ui", font=("Consolas", 10, "bold"))
+
+        self.canvas.create_text(24, 238, anchor="nw", text="Fill", fill=ACCENT_COLOR, font=("Consolas", 10, "bold"), tags="ui")
+        self.draw_color_swatches(FILL_PALETTE, 254, self.set_fill_color)
+        self.canvas.create_text(24, 280, anchor="nw", text="Outline", fill=ACCENT_COLOR, font=("Consolas", 10, "bold"), tags="ui")
+        self.draw_color_swatches(OUTLINE_PALETTE, 296, self.set_outline_color)
+
+        self.editor_button(20, 326, 182, 28, "Cycle BG Color", self.cycle_bg_color)
+
+        self.editor_button(20, 362, 88, 28, "Play", self.play_editor_level)
+        self.editor_button(114, 362, 88, 28, "Save", self.save_editor_level)
+        self.editor_button(20, 396, 88, 28, "Clear", self.clear_editor)
+        self.editor_button(114, 396, 88, 28, "Back", self.show_menu)
+        self.editor_button(20, 430, 88, 28, "< Pan", lambda: self.editor_pan(-EDITOR_PAN_STEP))
+        self.editor_button(114, 430, 88, 28, "Pan >", lambda: self.editor_pan(EDITOR_PAN_STEP))
+        self.editor_button(20, 464, 182, 28, "Load Level", self.load_level_from_file)
+
+        self.canvas.create_rectangle(EDITOR_VIEW_X0, 60, EDITOR_VIEW_X1, GROUND_Y + 20, fill="#0e1430", outline="#34406b", width=2, tags="ui")
+        self.canvas.create_line(EDITOR_VIEW_X0, GROUND_Y, EDITOR_VIEW_X1, GROUND_Y, fill=ACCENT_COLOR, width=2, tags="ui")
+
+        self.editor_tool_text = self.canvas.create_text(WIDTH - 30, 16, anchor="ne", text=f"Tool: {self.editor_tool}", fill=TEXT_COLOR, font=("Consolas", 12, "bold"), tags="ui")
+        self.editor_pos_text = self.canvas.create_text(WIDTH - 30, 36, anchor="ne", text="", fill="#9fb0e0", font=("Consolas", 10), tags="ui")
+
+        self.draw_editor_grid()
+        self.draw_editor_objects()
+        self.draw_editor_spawn_marker()
+        self.update_editor_pos_text()
+
+    def draw_color_swatches(self, palette, y, callback):
+        sx = 40
+        for color in palette:
+            rect = self.canvas.create_rectangle(sx, y, sx + 16, y + 16, fill=color, outline="#9fb0e0", width=1, tags="ui")
+            self.canvas.tag_bind(rect, "<Button-1>", lambda e, c=color: callback(c))
+            sx += 20
+
+    def set_tool(self, tool):
+        self.editor_tool = tool
+        self.canvas.itemconfig(self.editor_tool_text, text=f"Tool: {self.editor_tool}")
+
+    def set_fill_color(self, color):
+        self.editor_fill_color = color
+        if self.editor_selected_item is not None and 0 <= self.editor_selected_item < len(self.editor_level["objects"]):
+            self.editor_level["objects"][self.editor_selected_item]["fill"] = color
+        self.draw_editor_objects()
+
+    def set_outline_color(self, color):
+        self.editor_outline_color = color
+        if self.editor_selected_item is not None and 0 <= self.editor_selected_item < len(self.editor_level["objects"]):
+            self.editor_level["objects"][self.editor_selected_item]["outline"] = color
+        self.draw_editor_objects()
+
+    def cycle_bg_color(self):
+        self.editor_bg_index = (self.editor_bg_index + 1) % len(BG_PRESETS)
+        top, bottom = BG_PRESETS[self.editor_bg_index]
+        self.editor_level["bg_top"] = top
+        self.editor_level["bg_bottom"] = bottom
+        self.bg_top, self.bg_bottom = top, bottom
+        self.draw_background()
+        self.draw_editor_grid()
+        self.draw_editor_objects()
+        self.draw_editor_spawn_marker()
+
+    def update_editor_pos_text(self):
+        max_cam = max(0, EDITOR_LEVEL_WIDTH - (EDITOR_VIEW_X1 - EDITOR_VIEW_X0) / EDITOR_ZOOM)
+        self.canvas.itemconfig(self.editor_pos_text, text=f"Camera: {int(self.editor_camera_x)} / {int(max_cam)}")
+
+    def draw_editor_grid(self):
+        self.canvas.delete("editor_grid")
+        view_w_level = (EDITOR_VIEW_X1 - EDITOR_VIEW_X0) / EDITOR_ZOOM
+        first_col = math.floor(self.editor_camera_x / CUBE) * CUBE
+        lx = first_col
+        while lx < self.editor_camera_x + view_w_level + CUBE:
+            sx = self.editor_screen_x(lx)
+            if EDITOR_VIEW_X0 - 1 <= sx <= EDITOR_VIEW_X1 + 1:
+                self.canvas.create_line(sx, 60, sx, GROUND_Y, fill="#1c2748", tags=("editor_grid",))
+            lx += CUBE
+        y = GROUND_Y
+        while y > 60:
+            self.canvas.create_line(EDITOR_VIEW_X0, y, EDITOR_VIEW_X1, y, fill="#1c2748", tags=("editor_grid",))
+            y -= CUBE * EDITOR_ZOOM
+        self.canvas.tag_lower("editor_grid")
+        self.canvas.tag_raise("editor_grid", "ui")
+        for item in self.canvas.find_withtag("editor_grid"):
+            self.canvas.tag_raise(item)
+        self.canvas.tag_lower("editor_grid")
+        self.canvas.tag_raise("editor_grid")
+
+    def editor_pan(self, dx):
+        if self.mode != "editor":
+            return
+        view_w_level = (EDITOR_VIEW_X1 - EDITOR_VIEW_X0) / EDITOR_ZOOM
+        max_cam = max(0, EDITOR_LEVEL_WIDTH - view_w_level)
+        self.editor_camera_x = max(0, min(max_cam, self.editor_camera_x + dx))
+        self.draw_editor_grid()
+        self.draw_editor_objects()
+        self.draw_editor_spawn_marker()
+        self.update_editor_pos_text()
+
+    def editor_pan_start(self, event):
+        if self.mode == "editor":
+            self._pan_last_x = event.x
+
+    def editor_pan_drag(self, event):
+        if self.mode != "editor" or self._pan_last_x is None:
+            return
+        dx = (self._pan_last_x - event.x) / EDITOR_ZOOM
+        self._pan_last_x = event.x
+        self.editor_pan(dx)
+
+    def editor_pan_key(self, event):
+        if self.mode != "editor":
+            return
+        if event.keysym == "Left":
+            self.editor_pan(-EDITOR_PAN_STEP)
+        elif event.keysym == "Right":
+            self.editor_pan(EDITOR_PAN_STEP)
+
+    def editor_pan_wheel(self, event):
+        if self.mode != "editor":
+            return
+        delta = 0
+        if hasattr(event, "num") and event.num in (4, 5):
+            delta = -EDITOR_PAN_STEP if event.num == 4 else EDITOR_PAN_STEP
+        elif getattr(event, "delta", 0):
+            delta = -EDITOR_PAN_STEP if event.delta > 0 else EDITOR_PAN_STEP
+        if delta:
+            self.editor_pan(delta)
+
+    def draw_editor_objects(self):
+        self.canvas.delete("editor_obj")
+        for i, obj in enumerate(self.editor_level["objects"]):
+            sx = self.editor_screen_x(obj["x"])
+            w = obj["w"] * EDITOR_ZOOM
+            h = obj["h"] * EDITOR_ZOOM
+            if sx + w < EDITOR_VIEW_X0 or sx > EDITOR_VIEW_X1:
+                continue
+            sy = self.editor_screen_y(obj["y"])
+            fill = obj.get("fill") or DEFAULT_FILL.get(obj["type"], BLOCK_COLOR)
+            outline = obj.get("outline") or TEXT_COLOR
+            if obj["type"] == "spike":
+                pts = [sx, sy + h, sx + w / 2, sy, sx + w, sy + h]
+                item = self.canvas.create_polygon(pts, fill=fill, outline=outline, width=2, tags=("editor_obj", f"obj{i}"))
+            elif obj["type"] == "decor":
+                pts = [sx + w / 2, sy, sx + w, sy + h / 2, sx + w / 2, sy + h, sx, sy + h / 2]
+                item = self.canvas.create_polygon(pts, fill=fill, outline=outline, width=2, tags=("editor_obj", f"obj{i}"))
+            else:
+                item = self.canvas.create_rectangle(sx, sy, sx + w, sy + h, fill=fill, outline=outline, width=2, tags=("editor_obj", f"obj{i}"))
+            self.canvas.tag_bind(item, "<Button-1>", lambda e, idx=i: self.on_object_click(idx))
+        if self.editor_selected_item is not None and self.editor_selected_item < len(self.editor_level["objects"]):
+            self.draw_selection_box(self.editor_selected_item)
+
+    def draw_selection_box(self, idx):
+        self.canvas.delete("selection")
+        obj = self.editor_level["objects"][idx]
+        sx = self.editor_screen_x(obj["x"])
+        sy = self.editor_screen_y(obj["y"])
+        w = obj["w"] * EDITOR_ZOOM
+        h = obj["h"] * EDITOR_ZOOM
+        self.canvas.create_rectangle(sx - 3, sy - 3, sx + w + 3, sy + h + 3,
+                                      outline="#ffe066", width=3, tags="selection")
+
+    def draw_editor_spawn_marker(self):
+        self.canvas.delete("spawn_marker")
+        level_y = GROUND_Y - PLAYER_SIZE
+        sx = self.editor_screen_x(PLAYER_START_X)
+        size = PLAYER_SIZE * EDITOR_ZOOM
+        if sx + size < EDITOR_VIEW_X0 or sx > EDITOR_VIEW_X1:
+            return
+        sy = self.editor_screen_y(level_y)
+        self.canvas.create_rectangle(sx, sy, sx + size, sy + size, fill=PLAYER_COLOR, outline=TEXT_COLOR,
+                                      width=2, stipple="gray50", tags="spawn_marker")
+        self.canvas.create_text(sx + size / 2, sy - 10, text="Spawn", fill="#9fb0e0",
+                                 font=("Consolas", 9, "bold"), tags="spawn_marker")
+
+    def on_object_click(self, idx):
+        if self.editor_tool == "erase":
+            self.delete_object(idx)
+        else:
+            self.select_editor_object(idx)
+
+    def select_editor_object(self, idx):
+        self.editor_selected_item = idx
+        self.draw_selection_box(idx)
+
+    def delete_object(self, idx):
+        if 0 <= idx < len(self.editor_level["objects"]):
+            self.editor_level["objects"].pop(idx)
+            self.editor_selected_item = None
+            self.canvas.delete("selection")
+            self.draw_editor_objects()
+
+    def handle_editor_click(self, x, y):
+        if self.editor_tool == "erase":
+            return  # erasing happens by clicking an existing object directly
+        if x < EDITOR_VIEW_X0 or x > EDITOR_VIEW_X1 or y > GROUND_Y or y < 60:
+            return
+        # floor() (not round()) so whichever cell actually contains the
+        # click point is the one that gets the object -- clicking anywhere
+        # inside a cell now places the object in THAT cell, not a neighbour
+        level_x = self.editor_level_x(x)
+        col = math.floor(level_x / CUBE)
+        gx = col * CUBE
+        gx = max(0, min(EDITOR_LEVEL_WIDTH - CUBE, gx))
+
+        fill = self.editor_fill_color
+        outline = self.editor_outline_color
+
+        if self.editor_tool == "block":
+            # blocks always use a fixed cube size and stack cleanly on top
+            # of any blocks already in that column
+            stack = sum(1 for o in self.editor_level["objects"]
+                        if o["type"] == "block" and o["x"] == gx)
+            gy = GROUND_Y - CUBE * (stack + 1)
+            obj = {"type": "block", "x": gx, "y": gy, "w": CUBE, "h": CUBE}
+        elif self.editor_tool == "decor":
+            obj = {"type": "decor", "x": gx, "y": GROUND_Y - CUBE, "w": CUBE, "h": CUBE}
+        else:
+            obj = {"type": "spike", "x": gx, "y": GROUND_Y - CUBE, "w": CUBE, "h": CUBE}
+
+        if fill:
+            obj["fill"] = fill
+        if outline:
+            obj["outline"] = outline
+
+        # don't allow placing an object on top of one that's already there
+        for existing in self.editor_level["objects"]:
+            if (existing["x"] < obj["x"] + obj["w"] and existing["x"] + existing["w"] > obj["x"]
+                    and existing["y"] < obj["y"] + obj["h"] and existing["y"] + existing["h"] > obj["y"]):
+                return
+
+        self.editor_level["objects"].append(obj)
+        self.editor_selected_item = None
+        self.draw_editor_objects()
+
+    def editor_delete_selected(self, event=None):
+        if self.mode != "editor":
+            return
+        if self.editor_selected_item is not None and 0 <= self.editor_selected_item < len(self.editor_level["objects"]):
+            self.editor_level["objects"].pop(self.editor_selected_item)
+            self.editor_selected_item = None
+            self.canvas.delete("selection")
+            self.draw_editor_objects()
+
+    def clear_editor(self):
+        self.editor_level["objects"] = []
+        self.editor_selected_item = None
+        self.draw_editor_objects()
+
+    def save_editor_level(self):
+        name = self.prompt_text("Level name", "Custom Level")
+        if not name:
+            return
+        level = {"name": name, "speed": 1.0, "objects": list(self.editor_level["objects"]), "custom": True,
+                  "bg_top": self.editor_level.get("bg_top", BG_TOP), "bg_bottom": self.editor_level.get("bg_bottom", BG_BOTTOM)}
+        self.levels.append(level)
+        self.save_custom_levels()
+        messagebox.showinfo("Saved", f"Saved level '{name}' to {CUSTOM_LEVELS_FILE}")
+
+    def prompt_text(self, title, default=""):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.resizable(False, False)
+        win.grab_set()
+        tk.Label(win, text=title, font=("Consolas", 12, "bold")).pack(padx=14, pady=(14, 6))
+        entry = tk.Entry(win, width=30)
+        entry.insert(0, default)
+        entry.pack(padx=14, pady=6)
+        result = {"value": None}
+
+        def ok():
+            result["value"] = entry.get().strip()
+            win.destroy()
+
+        tk.Button(win, text="OK", command=ok).pack(pady=(6, 12))
+        entry.focus_set()
+        win.wait_window()
+        return result["value"]
+
+    def load_level_from_file(self):
+        path = filedialog.askopenfilename(initialdir=LEVELS_DIR, title="Open level JSON", filetypes=[("JSON files", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                level = json.load(f)
+            if "objects" not in level:
+                raise ValueError("Invalid level file")
+            level["custom"] = True
+            self.levels.append(level)
+            self.save_custom_levels()
+            messagebox.showinfo("Loaded", f"Loaded '{level.get('name', 'Unnamed')}'")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def play_editor_level(self):
+        self.levels.append({"name": self.editor_level.get("name", "Editor Level"), "speed": 1.0,
+                             "objects": list(self.editor_level["objects"]), "custom": True,
+                             "bg_top": self.editor_level.get("bg_top", BG_TOP),
+                             "bg_bottom": self.editor_level.get("bg_bottom", BG_BOTTOM)})
+        self.selected_level_index = len(self.levels) - 1
+        self.start_selected_level()
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+    def loop(self):
+        if self.mode == "game" and not self.game_over:
+            if self.started:
+                gravity = GRAVITY * (APEX_GRAVITY_SCALE if abs(self.vel_y) < APEX_THRESHOLD else 1.0)
+                self.vel_y += gravity
+                if self.vel_y > TERMINAL_VELOCITY:
+                    self.vel_y = TERMINAL_VELOCITY
+
+                prev_bottom = self.player_y + PLAYER_SIZE
+                self.player_y += self.vel_y
+                new_bottom = self.player_y + PLAYER_SIZE
+
+                landed_on_block = self.resolve_block_landing(prev_bottom, new_bottom)
+
+                if self.player_y >= GROUND_Y - PLAYER_SIZE:
+                    self.player_y = GROUND_Y - PLAYER_SIZE
+                    self.vel_y = 0
+                    self.on_ground = True
+                elif landed_on_block:
+                    self.on_ground = True
+                else:
+                    self.on_ground = False
+
+                if self.on_ground:
+                    self.rotation = 0
+                else:
+                    self.rotation = (self.rotation + 9) % 360
+
+                self.bg_offset += self.speed
+                self.canvas.coords(self.player, *self.player_points())
+
+                self.update_obstacles()
+                self.update_particles()
+
+                self.distance += self.speed
+                self.score = int(self.distance // 10)
+                self.canvas.itemconfig(self.score_text, text=f"Score: {self.score}")
+
+                result = self.check_collision()
+                if result == "death":
+                    self.end_game(win=False)
+                elif result == "finish":
+                    self.end_game(win=True)
+            else:
+                self.canvas.coords(self.player, *self.player_points())
+            if not self.game_over:
+                self.draw_background()
+                self.canvas.tag_raise("game")
+                self.canvas.tag_raise("ui")
+                self.canvas.tag_raise(self.player)
+                self.canvas.coords(self.player, *self.player_points())
+                self.canvas.itemconfig(self.level_text, text=f"Level: {self.level['name']}")
+        elif self.mode == "editor":
+            self.draw_background()
+            self.canvas.tag_raise("ui")
+            self.canvas.tag_raise("editor_grid")
+            self.canvas.tag_raise("editor_obj")
+            self.canvas.tag_raise("spawn_marker")
+            self.canvas.tag_raise("selection")
+        else:
+            self.draw_background()
+            self.canvas.tag_raise("ui")
+
+        self.schedule_loop()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    GeometryDash(root)
+    root.mainloop()
